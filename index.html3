@@ -1,0 +1,259 @@
+<script>
+// ══════════════════════════════════════════════════════════════════
+// CONFIGURATION
+// ══════════════════════════════════════════════════════════════════
+const API_BASE = 'https://apihub.agnes-ai.com/v1';
+const POLL_BASE = 'https://apihub.agnes-ai.com/agnesapi';
+const MODEL_VIDEO = 'agnes-video-v2.0';
+const FRAME_RATE = 24;
+const NUM_FRAMES = 241;
+
+const API_KEY_STORAGE = 'kata_video_10s_key_v2';
+const VIDEO_FIRST_POLL_DELAY_SEC = 20;
+const VIDEO_POLL_INTERVALS = [5, 5, 8, 8, 12, 12, 15];
+const VIDEO_MAX_POLL_ATTEMPTS = 150;
+
+// ══════════════════════════════════════════════════════════════════
+// ÉTAT
+// ══════════════════════════════════════════════════════════════════
+const state = {
+  apiKey: '',
+  photoDataUri: null,
+  isGenerating: false,
+  stopRequested: false,
+  workingPollBuilder: null,
+  wakeLockSentinel: null
+};
+
+// ══════════════════════════════════════════════════════════════════
+// UTILITAIRES
+// ══════════════════════════════════════════════════════════════════
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
+
+let toastTimeout=null;
+function showToast(message,type='success',duration=2800){
+  const t=document.getElementById('toast');
+  const i=document.getElementById('toast-icon');
+  const x=document.getElementById('toast-text');
+  if(!t||!i||!x)return;
+  t.classList.remove('visible','success','error','warn');
+  void t.offsetWidth;
+  const icons={success:'✓',error:'✕',warn:'⚠'};
+  i.textContent=icons[type]||'✓';
+  x.textContent=message;
+  t.classList.add(type);
+  requestAnimationFrame(()=>t.classList.add('visible'));
+  if(toastTimeout)clearTimeout(toastTimeout);
+  toastTimeout=setTimeout(()=>t.classList.remove('visible'),duration);
+}
+
+// ══════════════════════════════════════════════════════════════════
+// JOURNAL & DEBUG
+// ══════════════════════════════════════════════════════════════════
+function journalLog(msg, level){
+  level = level || 'info';
+  const body = document.getElementById('journal-body');
+  if(!body) return;
+  const icons = { info:'·', highlight:'▶', success:'✅', warn:'⚠️', error:'❌', video:'🎥' };
+  const icon = icons[level] || '·';
+  const time = new Date().toLocaleTimeString('fr-FR',{hour12:false});
+  const entry = document.createElement('div');
+  entry.className = 'j-entry ' + level;
+  entry.innerHTML = '<span class="j-time">'+time+'</span><span class="j-icon">'+icon+'</span><span class="j-msg">'+esc(msg)+'</span>';
+  body.appendChild(entry);
+  body.scrollTop = body.scrollHeight;
+}
+
+function debugLog(level,category,message,data){
+  const body=document.getElementById('tech-body');if(!body)return;
+  const time=new Date().toLocaleTimeString('fr-FR',{hour12:false});
+  const entry=document.createElement('div');entry.className='debug-entry '+level;
+  let html='<span class="debug-time">'+time+'</span><span class="debug-cat">['+esc(category)+']</span><span class="debug-msg">'+esc(message)+'</span>';
+  if(data!==undefined&&data!==null){
+    let ds;if(typeof data==='string')ds=data;else{try{ds=JSON.stringify(data,null,2)}catch(e){ds=String(data)}}
+    if(ds.length>2000)ds=ds.slice(0,2000)+'\n…[tronqué]';
+    html+='<pre style="margin-top:.3rem;padding:.4rem;background:#0a0a12;border:1px solid #2a2a3a;font-size:.65rem;color:#a8d8b0;max-height:150px;overflow:auto;white-space:pre-wrap;word-break:break-all;">'+esc(ds)+'</pre>';
+  }
+  entry.innerHTML=html;body.appendChild(entry);
+  body.scrollTop=body.scrollHeight;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// CLÉ API
+// ══════════════════════════════════════════════════════════════════
+function getApiKey(){try{return(localStorage.getItem(API_KEY_STORAGE)||'').trim()}catch(e){return''}}
+
+function saveApiKey(){
+  const input=document.getElementById('api-key-input');
+  if(!input)return;
+  const key=input.value.trim();
+  if(!key){showToast('Collez votre clé d\'abord','warn');return}
+  if(!key.startsWith('sk-')){if(!confirm('La clé ne commence pas par "sk-". Sauvegarder quand même ?'))return}
+  try{
+    localStorage.setItem(API_KEY_STORAGE,key);
+    state.apiKey=key;
+    updateApiPanel();
+    showToast('Clé enregistrée ✓','success');
+    journalLog('Clé API enregistrée','success');
+    debugLog('success','API','Clé : '+key.slice(0,8)+'…'+key.slice(-4));
+    input.blur();
+  }catch(e){showToast('Erreur sauvegarde','error')}
+}
+
+function updateApiPanel(){
+  const panel=document.getElementById('api-panel');
+  const input=document.getElementById('api-key-input');
+  const line=document.getElementById('api-status-line');
+  const text=document.getElementById('api-status-text');
+  const key=getApiKey();
+  state.apiKey=key;
+  if(!panel||!input||!line||!text)return;
+  if(key){
+    panel.classList.add('ok');line.classList.add('ok');
+    text.textContent='Clé active · '+key.slice(0,8)+'…'+key.slice(-4);
+    input.value=key;
+  }else{
+    panel.classList.remove('ok');line.classList.remove('ok');
+    text.textContent='Aucune clé API enregistrée';
+    input.value='';
+    input.placeholder='sk-xxxxxxxxxxxxxxxxxxxxxxxx';
+  }
+  updateGenerateBtn();
+}
+
+// ══════════════════════════════════════════════════════════════════
+// PHOTO
+// ══════════════════════════════════════════════════════════════════
+function fileToDataUri(file){
+  return new Promise((resolve,reject)=>{
+    const reader=new FileReader();
+    reader.onload=e=>resolve(e.target.result);
+    reader.onerror=()=>reject(new Error('Erreur lecture'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function compressImage(dataUrl, maxSide){
+  return new Promise((resolve)=>{
+    const img=new Image();
+    img.onload=()=>{
+      let{width,height}=img;
+      const scale=Math.min(1,maxSide/Math.max(width,height));
+      width=Math.round(width*scale);
+      height=Math.round(height*scale);
+      const canvas=document.createElement('canvas');
+      canvas.width=width;canvas.height=height;
+      const ctx=canvas.getContext('2d');
+      ctx.drawImage(img,0,0,width,height);
+      resolve(canvas.toDataURL('image/jpeg',0.9));
+    };
+    img.onerror=()=>resolve(dataUrl);
+    img.src=dataUrl;
+  });
+}
+
+async function handlePhoto(file){
+  if(!file)return;
+  if(!file.type.startsWith('image/')){showToast('Fichier non image','error');return}
+  if(file.size>15*1024*1024){showToast('Image trop lourde (max 15 Mo)','error');return}
+  try{
+    const raw=await fileToDataUri(file);
+    const compressed=await compressImage(raw,1280);
+    state.photoDataUri=compressed;
+    document.getElementById('photo-preview-img').src=compressed;
+    document.getElementById('photo-preview-container').classList.remove('hidden');
+    document.getElementById('upload-zone').classList.add('hidden');
+    showToast('Photo chargée ✓','success');
+    journalLog('Photo chargée ('+Math.round(compressed.length/1024)+' Ko)','success');
+    debugLog('success','PHOTO','Image chargée');
+    updateGenerateBtn();
+  }catch(e){
+    showToast('Erreur chargement photo','error');
+    debugLog('error','PHOTO',e.message);
+  }
+}
+
+function removePhoto(){
+  state.photoDataUri=null;
+  document.getElementById('photo-preview-container').classList.add('hidden');
+  document.getElementById('upload-zone').classList.remove('hidden');
+  document.getElementById('photo-preview-img').src='';
+  document.getElementById('file-input').value='';
+  showToast('Photo retirée','warn');
+  updateGenerateBtn();
+}
+
+// ══════════════════════════════════════════════════════════════════
+// BOUTON
+// ══════════════════════════════════════════════════════════════════
+function updateGenerateBtn(){
+  const btn=document.getElementById('generate-btn');
+  if(!btn)return;
+  const hasKey=!!state.apiKey;
+  const hasPhoto=!!state.photoDataUri;
+  btn.disabled=!hasKey||!hasPhoto||state.isGenerating;
+  if(state.isGenerating)btn.textContent='⏳ Génération en cours…';
+  else if(!hasKey)btn.textContent='🔑 Enregistrez d\'abord votre clé API';
+  else if(!hasPhoto)btn.textContent='📸 Choisissez d\'abord une photo';
+  else btn.textContent='▶ Générer la vidéo 10s';
+}
+
+// ══════════════════════════════════════════════════════════════════
+// API AGNES
+// ══════════════════════════════════════════════════════════════════
+async function apiFetch(url, options, label, maxAttempts){
+  options=options||{};
+  label=label||'API';
+  maxAttempts=maxAttempts||5;
+  let lastErr=null;
+
+  for(let attempt=0;attempt<maxAttempts;attempt++){
+    if(state.stopRequested)throw new Error('Arrêt demandé');
+    try{
+      const t0=Date.now();
+      const res=await fetch(url,options);
+      const dt=Date.now()-t0;
+      let retryAfter=0;
+      try{retryAfter=parseInt(res.headers.get('Retry-After')||'0',10)||0}catch(e){}
+      let errorText='';
+      if(!res.ok){try{errorText=(await res.clone().text()).slice(0,1000)}catch(e){}}
+      debugLog('response','RÉP '+label,'HTTP '+res.status+' en '+dt+'ms',errorText||undefined);
+
+      if(res.ok)return res;
+
+      if([400,401,403,404].includes(res.status)){
+        throw new Error('HTTP '+res.status+' — '+errorText.slice(0,300));
+      }
+
+      if(res.status===429){
+        const wait=retryAfter>0?retryAfter:Math.min(90,20+attempt*15);
+        debugLog('warn','RATELIMIT','429 — attente '+wait+'s');
+        showToast('Limite API — attente '+wait+'s','warn',2000);
+        await sleep(wait*1000);
+        continue;
+      }
+
+      if([500,502,503,504].includes(res.status)){
+        const wait=Math.min(45,8+attempt*6);
+        debugLog('warn','SERVICE','HTTP '+res.status+' — attente '+wait+'s');
+        showToast('Service occupé — reprise dans '+wait+'s','warn',2000);
+        await sleep(wait*1000);
+        continue;
+      }
+
+      const wait=Math.min(45,6+attempt*5);
+      debugLog('warn','HTTP','HTTP '+res.status+' — retry dans '+wait+'s');
+      await sleep(wait*1000);
+    }catch(e){
+      if(e.message==='Arrêt demandé')throw e;
+      if(/^HTTP (4\d\d)/.test(e.message))throw e;
+      lastErr=e;
+      const wait=Math.min(40,4+attempt*4);
+      debugLog('warn','NETWORK',e.message+' — retry dans '+wait+'s');
+      showToast('Connexion instable — reprise dans '+wait+'s','warn',2000);
+      await sleep(wait*1000);
+    }
+  }
+  throw lastErr||new Error('Tentatives épuisées pour '+label);
+}
