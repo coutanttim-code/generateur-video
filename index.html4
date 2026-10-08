@@ -1,0 +1,269 @@
+
+// ══════════════════════════════════════════════════════════════════
+// CRÉATION DE LA TÂCHE VIDÉO
+// ══════════════════════════════════════════════════════════════════
+async function createVideoTask(imageDataUri, prompt){
+  const body={
+    model:MODEL_VIDEO,
+    prompt:prompt||'Animate this image gently, subtle movement, breathing, light, and atmosphere. Keep the subject identical.',
+    image:imageDataUri,
+    num_frames:NUM_FRAMES,
+    frame_rate:FRAME_RATE
+  };
+  debugLog('api','POST /videos','Création de la tâche (10s, 241 frames)');
+  journalLog('Envoi de la tâche vidéo à Agnes…','video');
+
+  const res=await apiFetch(API_BASE+'/videos',{
+    method:'POST',
+    headers:{
+      'Authorization':'Bearer '+state.apiKey,
+      'Content-Type':'application/json'
+    },
+    body:JSON.stringify(body)
+  },'Video Task',3);
+
+  const data=await res.json();
+  debugLog('response','VIDÉO CRÉÉE','Réponse reçue',data);
+  const videoId=data.video_id||data.id||data.task_id;
+  if(!videoId)throw new Error('Pas de video_id retourné');
+  journalLog('Tâche créée : '+String(videoId).slice(0,40)+'…','success');
+  return videoId;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// POLLING DE LA VIDÉO
+// ══════════════════════════════════════════════════════════════════
+async function pollVideo(videoId, onProgress){
+  let remaining=VIDEO_FIRST_POLL_DELAY_SEC;
+  while(remaining>0){
+    if(state.stopRequested)throw new Error('Arrêt demandé');
+    onProgress('Préparation — '+remaining+'s');
+    await sleep(1000);
+    remaining--;
+  }
+
+  for(let attempt=0;attempt<VIDEO_MAX_POLL_ATTEMPTS;attempt++){
+    if(state.stopRequested)throw new Error('Arrêt demandé');
+
+    if(attempt>0){
+      const idx=Math.min(attempt-1,VIDEO_POLL_INTERVALS.length-1);
+      let r=VIDEO_POLL_INTERVALS[idx];
+      while(r>0){
+        if(state.stopRequested)throw new Error('Arrêt demandé');
+        onProgress('Création — '+r+'s');
+        await sleep(1000);
+        r--;
+      }
+    }
+
+    const url=POLL_BASE+'?video_id='+encodeURIComponent(videoId)+'&model_name='+encodeURIComponent(MODEL_VIDEO);
+    const res=await apiFetch(url,{method:'GET',headers:{'Authorization':'Bearer '+state.apiKey}},'Polling',2);
+    const d=await res.json();
+    const status=d.status||'unknown';
+    const progress=d.progress||0;
+    onProgress('Création — '+progress+'%');
+    debugLog('info','POLLING','status='+status+' progress='+progress+'%');
+
+    if(status==='completed'||status==='succeeded'||status==='done'){
+      const videoUrl=(d.metadata&&d.metadata.url)||d.url||(d.output&&d.output.url);
+      if(!videoUrl)throw new Error('Terminé mais pas d\'URL');
+      return videoUrl;
+    }
+    if(status==='failed'||status==='error'||status==='cancelled'){
+      throw new Error('Échec ('+status+')');
+    }
+  }
+  throw new Error('Délai maximal dépassé');
+}
+
+// ══════════════════════════════════════════════════════════════════
+// WAKE LOCK
+// ══════════════════════════════════════════════════════════════════
+async function requestWakeLock(){
+  if(!('wakeLock' in navigator))return;
+  try{
+    state.wakeLockSentinel=await navigator.wakeLock.request('screen');
+    debugLog('info','WAKELOCK','Activé');
+  }catch(e){debugLog('warn','WAKELOCK','Refusé : '+e.message)}
+}
+
+async function releaseWakeLock(){
+  if(state.wakeLockSentinel){
+    try{await state.wakeLockSentinel.release()}catch(e){}
+    state.wakeLockSentinel=null;
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// FONCTION PRINCIPALE
+// ══════════════════════════════════════════════════════════════════
+async function generateVideo(){
+  if(state.isGenerating)return;
+  if(!state.apiKey){showToast('Enregistrez d\'abord votre clé API','error');return}
+  if(!state.photoDataUri){showToast('Choisissez d\'abord une photo','error');return}
+
+  state.isGenerating=true;
+  state.stopRequested=false;
+  updateGenerateBtn();
+
+  document.getElementById('stop-btn').style.display='block';
+  document.getElementById('progress-bar').classList.add('visible');
+  document.getElementById('progress-info').style.display='flex';
+  document.getElementById('result-container').classList.add('hidden');
+  document.getElementById('progress-fill').style.width='0%';
+
+  await requestWakeLock();
+  journalLog('Démarrage de la génération…','highlight');
+
+  const prompt=document.getElementById('prompt-input').value.trim();
+
+  try{
+    const videoId=await createVideoTask(state.photoDataUri, prompt);
+    const videoUrl=await pollVideo(videoId,(prog)=>{
+      document.getElementById('progress-label').textContent=prog;
+      const match=prog.match(/(\d+)/);
+      if(match){
+        const val=parseInt(match[1],10);
+        document.getElementById('progress-fill').style.width=Math.min(val,95)+'%';
+      }
+    });
+
+    document.getElementById('progress-fill').style.width='100%';
+    document.getElementById('progress-label').textContent='✦ Terminé ✦';
+    document.getElementById('result-video').src=videoUrl;
+    document.getElementById('result-container').classList.remove('hidden');
+    document.getElementById('download-btn').onclick=()=>{
+      const a=document.createElement('a');
+      a.href=videoUrl;
+      a.download='kata-video-10s.mp4';
+      a.target='_blank';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    };
+    journalLog('Vidéo générée avec succès !','success');
+    showToast('Vidéo prête ✓','success');
+
+  }catch(e){
+    if(e.message==='Arrêt demandé'){
+      journalLog('Génération arrêtée','warn');
+      showToast('Génération arrêtée','warn');
+    }else{
+      journalLog('Erreur : '+e.message,'error');
+      showToast('Erreur : '+e.message.slice(0,60),'error',5000);
+      debugLog('error','GENERATE',e.message);
+    }
+  }
+
+  state.isGenerating=false;
+  state.stopRequested=false;
+  updateGenerateBtn();
+  document.getElementById('stop-btn').style.display='none';
+  await releaseWakeLock();
+}
+
+// ══════════════════════════════════════════════════════════════════
+// INITIALISATION
+// ══════════════════════════════════════════════════════════════════
+(function init(){
+  const apiSaveBtn=document.getElementById('api-save-btn');
+  if(apiSaveBtn){
+    apiSaveBtn.addEventListener('click',(e)=>{
+      e.preventDefault();
+      saveApiKey();
+    });
+  }
+
+  const fileInput=document.getElementById('file-input');
+  if(fileInput){
+    fileInput.addEventListener('change',(e)=>{
+      const file=e.target.files&&e.target.files[0];
+      if(file)handlePhoto(file);
+    });
+  }
+
+  const removeBtn=document.getElementById('photo-remove-btn');
+  if(removeBtn){
+    removeBtn.addEventListener('click',(e)=>{
+      e.preventDefault();
+      e.stopPropagation();
+      removePhoto();
+    });
+  }
+
+  const genBtn=document.getElementById('generate-btn');
+  if(genBtn){
+    genBtn.addEventListener('click',(e)=>{
+      e.preventDefault();
+      generateVideo();
+    });
+  }
+
+  const stopBtn=document.getElementById('stop-btn');
+  if(stopBtn){
+    stopBtn.addEventListener('click',(e)=>{
+      e.preventDefault();
+      state.stopRequested=true;
+      journalLog('Arrêt demandé…','warn');
+    });
+  }
+
+  const tabJournal=document.getElementById('tab-journal');
+  const tabTech=document.getElementById('tab-tech');
+  if(tabJournal&&tabTech){
+    tabJournal.addEventListener('click',()=>{
+      document.getElementById('journal-body').classList.remove('hidden');
+      document.getElementById('tech-body').classList.add('hidden');
+      tabJournal.classList.add('active');
+      tabTech.classList.remove('active');
+    });
+    tabTech.addEventListener('click',()=>{
+      document.getElementById('tech-body').classList.remove('hidden');
+      document.getElementById('journal-body').classList.add('hidden');
+      tabTech.classList.add('active');
+      tabJournal.classList.remove('active');
+    });
+  }
+
+  const collapseBtn=document.getElementById('debug-collapse-btn');
+  if(collapseBtn){
+    collapseBtn.addEventListener('click',(e)=>{
+      e.stopPropagation();
+      const panel=document.getElementById('debug-panel');
+      panel.classList.toggle('collapsed');
+      collapseBtn.textContent=panel.classList.contains('collapsed')?'+':'−';
+    });
+  }
+
+  const clearBtn=document.getElementById('debug-clear-btn');
+  if(clearBtn){
+    clearBtn.addEventListener('click',(e)=>{
+      e.stopPropagation();
+      document.getElementById('journal-body').innerHTML='';
+      document.getElementById('tech-body').innerHTML='';
+    });
+  }
+
+  const copyBtn=document.getElementById('debug-copy-btn');
+  if(copyBtn){
+    copyBtn.addEventListener('click',(e)=>{
+      e.stopPropagation();
+      const j=document.getElementById('journal-body').innerText;
+      try{
+        navigator.clipboard.writeText(j);
+        showToast('Console copiée','success');
+      }catch(err){
+        showToast('Copie impossible','error');
+      }
+    });
+  }
+
+  updateApiPanel();
+  updateGenerateBtn();
+
+  journalLog('Application prête. Collez votre clé API puis choisissez une photo.','highlight');
+  debugLog('success','INIT','Kata Video 10s prêt');
+})();
+</script>
+</body>
+</html>
